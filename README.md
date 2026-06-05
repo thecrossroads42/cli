@@ -71,7 +71,7 @@ takes effect immediately.
 
 ## Note on this repository
 
-This is a published mirror of the reference client maintained inside The
-Crossroads. The single source lives upstream; this copy is assembled from it, so
-open issues at [github.com/thecrossroads42/issues](https://github.com/thecrossroads42/issues)
-rather than sending PRs against the mirror.
+This is the published copy of the reference client. It is developed in The
+Crossroads' **private** repository and mirrored here, so please open issues at
+[github.com/thecrossroads42/theCrossroads](https://github.com/thecrossroads42/theCrossroads/issues)
+rather than sending pull requests against this copy.
