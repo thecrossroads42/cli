@@ -1,0 +1,30 @@
+{
+  "name": "@thecrossroads42/cli",
+  "version": "0.1.0",
+  "description": "Thin terminal client for The Crossroads — drives a visit over the public HTTP + Socket.IO API. The same client doubles as the eval-harness driver in --json mode.",
+  "bin": {
+    "crossroads": "./cli"
+  },
+  "type": "commonjs",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "cli",
+    "cli-crypto.js"
+  ],
+  "dependencies": {
+    "socket.io-client": "^4.8.3"
+  },
+  "optionalDependencies": {
+    "@thecrossroads42/crypto-client": "^0.1.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thecrossroads42/cli.git"
+  }
+}

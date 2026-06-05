@@ -1,0 +1,527 @@
+#!/usr/bin/env node
+// =============================================================================
+// The Crossroads — thin command-line client.
+// Talks to the backend ONLY through the public HTTP + Socket.IO APIs.
+// stdin: each line is a user message. stdout: rendered conversation.
+// stderr: version stamp + raw transcript (for harness capture).
+// =============================================================================
+
+const { io } = require('socket.io-client');
+const readline = require('node:readline');
+const { execSync } = require('node:child_process');
+const { setupEncryption } = require('./cli-crypto.js');
+
+const ROOT = __dirname;
+
+const USAGE = `The Crossroads CLI — thin terminal client.
+
+Usage:
+  cli [--token <api-key|jwt|user_id>] [--resume <id> | --delete <id> | --list] [--api <url>] [--json]
+
+Auth (required): --token <value> or TOKEN env. <value> is a personal API key
+(tcr_…, from Settings → API Access), a JWT, or a user_* id.
+Backend URL:     --api <url> or API_URL env (default http://localhost:3001).
+
+Modes:
+  (none)         start a new visit (blocked if one is already ongoing)
+  --resume <id>  rejoin an ongoing visit
+  --delete <id>  delete a visit and exit
+  --list         list visits and exit
+
+stdin: each line is a user message. EOF leaves the visit open (resumable).
+stdout: rendered conversation. stderr: version stamp + raw transcript.
+
+--json: machine-driver mode for the eval harness. Suppresses the
+human-rendered stdout and instead emits one NDJSON record per line to
+stdout: a {type:"version"} record at startup, one {type:"turn"} record
+per greeting/chat (carrying the authoritative done payload + the turn's
+raw delimiter text), and a {type:"end"} record. stderr is unchanged.
+`;
+
+// ---------- arg parsing ----------
+const argv = process.argv.slice(2);
+const flagValue = (name) => {
+  const i = argv.indexOf(name);
+  return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
+};
+const hasFlag = (name) => argv.includes(name);
+
+if (hasFlag('--help') || hasFlag('-h')) {
+  process.stderr.write(USAGE);
+  process.exit(0);
+}
+
+const credential = flagValue('--token') || process.env.TOKEN;
+const apiUrl = (flagValue('--api') || process.env.API_URL || 'http://localhost:3001').replace(/\/+$/, '');
+const resumeId = flagValue('--resume');
+const deleteId = flagValue('--delete');
+const wantList = hasFlag('--list');
+const jsonMode = hasFlag('--json');
+// Passphrase for a passphrase-encrypted account (else the prompt-free env var).
+// Only used when the account turns out to be encrypted with the passphrase tier.
+const passphrase = flagValue('--passphrase') || process.env.CROSSROADS_PASSPHRASE || '';
+
+function die(msg, code = 1) {
+  process.stderr.write(`error: ${msg}\n`);
+  process.exit(code);
+}
+
+if (!credential) {
+  die('no credential. Pass --token <jwt|user_id> or set TOKEN. (--help for usage)');
+}
+
+// A user_* id authenticates as a legacy userId; anything else (a JWT or a
+// tcr_ personal API key) goes in the handshake `token`, which the server
+// resolves by shape.
+const socketAuth = credential.startsWith('user_') ? { userId: credential } : { token: credential };
+const authHeader = { Authorization: `Bearer ${credential}` };
+
+// ---------- HTTP ----------
+async function api(method, apiPath, body) {
+  let res;
+  try {
+    res = await fetch(`${apiUrl}/api${apiPath}`, {
+      method,
+      headers: { 'Content-Type': 'application/json', ...authHeader },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch (e) {
+    throw new Error(`cannot reach backend at ${apiUrl} (${e.message})`);
+  }
+  if (!res.ok) {
+    const err = new Error(`HTTP ${res.status} on ${method} ${apiPath}`);
+    err.status = res.status;
+    throw err;
+  }
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+// ---------- machine output (stdout, --json mode) ----------
+// One JSON object per line. The harness reads these; nothing else is
+// written to stdout in --json mode so the stream stays parseable.
+function emitJson(obj) {
+  process.stdout.write(JSON.stringify(obj) + '\n');
+}
+
+// ---------- rendering (stdout) ----------
+function render(name, content) {
+  if (jsonMode) return;
+  process.stdout.write(`\n--- ${name} ---\n`);
+  process.stdout.write(`${(content ?? '').toString().trimEnd()}\n`);
+}
+
+function renderStored(m) {
+  if (m.type === 'user') render('you', m.content);
+  else render(m.memberName || 'voice', m.content);
+}
+
+// Progressive renderer for the chat mega-batch stream. The stream is line-oriented:
+// delimiters sit on their own line, response bodies follow. We stream the renderable
+// sections (primary / non-PASS debaters / moderator summary) to stdout with separator
+// headers, resolving voice ids to names, and drop metadata/control sections.
+function makeChatRenderer(voiceNames, keeperName) {
+  const SECTION_OF = {
+    '===SCORES===': 'ignore',
+    '===PRIMARY_VOICE===': 'primary_voice',
+    '===PRIMARY_RESPONSE===': 'primary_response',
+    '===DEBATE_VOICE===': 'debate_voice',
+    '===DEBATE_RESPONSE===': 'debate_response',
+    '===DEBATE_CONCLUDED===': 'ignore',
+    '===MODERATOR_SUMMARY===': 'moderator_summary',
+    '===VISIT_CONCLUDED===': 'ignore',
+    '===END===': 'ignore',
+  };
+  const nameFor = (id) => voiceNames.get(id) || id || 'voice';
+  const isPass = (t) => /^pass[\s.!,:;-]*$/i.test(t);
+  const out = (s) => { if (!jsonMode) process.stdout.write(s); };
+
+  let buf = '';
+  let section = 'ignore';
+  let primaryName = 'voice';
+  let debaterName = 'voice';
+  let headerPrinted = false;
+  let debateDecision; // undefined | 'skip' | 'print'
+
+  const header = (name) => {
+    if (!headerPrinted) {
+      out(`\n--- ${name} ---\n`);
+      headerPrinted = true;
+    }
+  };
+
+  function classify(t) {
+    if (SECTION_OF[t]) return SECTION_OF[t];
+    if (t.startsWith('===ROUND_')) return 'ignore';
+    if (/^===[A-Z0-9_]+===$/.test(t)) return 'ignore';
+    return null;
+  }
+
+  function handleLine(line) {
+    const t = line.trim();
+    const tok = classify(t);
+    if (tok) {
+      section = tok;
+      headerPrinted = false;
+      if (tok === 'debate_response') debateDecision = undefined;
+      return;
+    }
+    switch (section) {
+      case 'primary_voice': if (t) primaryName = nameFor(t); break;
+      case 'debate_voice': if (t) debaterName = nameFor(t); break;
+      case 'primary_response': header(primaryName); out(line + '\n'); break;
+      case 'moderator_summary': header(keeperName); out(line + '\n'); break;
+      case 'debate_response':
+        if (debateDecision === 'skip') break;
+        if (debateDecision === 'print') { out(line + '\n'); break; }
+        if (t === '') break; // skip leading blanks while deciding PASS vs content
+        if (isPass(t)) { debateDecision = 'skip'; break; }
+        debateDecision = 'print';
+        header(debaterName);
+        out(line + '\n');
+        break;
+      default: break; // ignore / scores
+    }
+  }
+
+  return {
+    feed(text) {
+      buf += text;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        handleLine(buf.slice(0, i));
+        buf = buf.slice(i + 1);
+      }
+    },
+    end() {
+      if (buf.length) { handleLine(buf); buf = ''; }
+    },
+  };
+}
+
+// ---------- version stamp (stderr) ----------
+// The repo commit pins prompts + models + code together, so it is the
+// version key the harness stamps onto every transcript.
+function gitStamp() {
+  try {
+    const git = (cmd) => execSync(cmd, { cwd: ROOT, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+    return {
+      available: true,
+      short: git('git rev-parse --short HEAD'),
+      full: git('git rev-parse HEAD'),
+      dirty: git('git status --porcelain').length > 0,
+    };
+  } catch {
+    return { available: false, short: null, full: null, dirty: false };
+  }
+}
+
+function printVersionStamp(repo) {
+  const stamp = repo.available
+    ? `${repo.short} (${repo.full})${repo.dirty ? ' [dirty working tree]' : ''}`
+    : 'unknown (not a git checkout)';
+  process.stderr.write(
+    '=== The Crossroads CLI ===\n' +
+    `backend: ${apiUrl}\n` +
+    `repo (pins prompts/models/code): ${stamp}\n` +
+    '==========================\n'
+  );
+}
+
+// ---------- conversation history (mirrors backend buildConversationHistory) ----------
+function toConversationHistory(messages) {
+  return messages
+    .filter((m) => (m.type === 'user' || m.type === 'voice') && m.content && !m.isGreeting)
+    .map((m) => ({ role: m.type === 'user' ? 'user' : 'assistant', content: m.content }));
+}
+
+// Set in main() once the account's encryption state is known. null = plaintext
+// account; otherwise the handler that encrypts writes / decrypts reads.
+let encState = null;
+
+async function persist(visitId, messages, extra = {}) {
+  try {
+    const body = encState
+      ? await encState.encryptPut(visitId, { messages, ...extra })
+      : { messages, ...extra };
+    await api('PUT', `/visits/${visitId}`, body);
+  } catch (e) {
+    process.stderr.write(`\n[warn] failed to save visit: ${e.message}\n`);
+  }
+}
+
+// ---------- visit-lifecycle guards (mirror the web) ----------
+async function guardNoOngoing() {
+  let visits;
+  try {
+    visits = await api('GET', '/visits');
+  } catch (e) {
+    die(`could not list visits: ${e.message}`);
+  }
+  const ongoing = (visits || []).find((v) => v.endDate == null);
+  if (ongoing) {
+    die(
+      `there is already an ongoing visit #${ongoing.id}. ` +
+      `Rejoin it with --resume ${ongoing.id}, or remove it with --delete ${ongoing.id} and start fresh.`
+    );
+  }
+}
+
+async function loadVisitForResume(id) {
+  let visit;
+  try {
+    visit = await api('GET', `/visits/${encodeURIComponent(id)}`);
+  } catch (e) {
+    if (e.status === 404) die(`visit #${id} not found.`);
+    die(`could not load visit #${id}: ${e.message}`);
+  }
+  if (visit.endDate != null) {
+    die(`visit #${id} is completed and cannot be rejoined. Start a new visit, or --delete ${id}.`);
+  }
+  return visit;
+}
+
+// ---------- socket ----------
+function connect(socket) {
+  return new Promise((resolve) => {
+    socket.once('connect', resolve);
+    socket.once('connect_error', (e) => die(`socket connection failed: ${e.message}`));
+  });
+}
+
+// ---------- main ----------
+async function main() {
+  const repo = gitStamp();
+  printVersionStamp(repo);
+  if (jsonMode) emitJson({ type: 'version', backend: apiUrl, repo });
+
+  if (deleteId !== undefined) {
+    try {
+      await api('DELETE', `/visits/${encodeURIComponent(deleteId)}`);
+    } catch (e) {
+      if (e.status === 404) die(`visit #${deleteId} not found.`);
+      die(`could not delete visit #${deleteId}: ${e.message}`);
+    }
+    process.stdout.write(`Deleted visit #${deleteId}.\n`);
+    return;
+  }
+
+  if (wantList) {
+    let visits;
+    try {
+      visits = await api('GET', '/visits');
+    } catch (e) {
+      die(`could not list visits: ${e.message}`);
+    }
+    if (!visits || visits.length === 0) {
+      process.stdout.write('No visits.\n');
+      return;
+    }
+    for (const v of visits) {
+      const status = v.endDate == null ? 'ongoing' : 'completed';
+      const when = new Date(v.startDate).toISOString();
+      process.stdout.write(`#${v.id}\t${status}\t${when}\t${v.name || ''}\n`);
+    }
+    return;
+  }
+
+  const socket = io(apiUrl, { transports: ['websocket'], auth: socketAuth, reconnection: false });
+  await connect(socket);
+
+  // Voice id -> display name (for labelling the streamed response). Best-effort.
+  let voiceNames = new Map();
+  let keeperName = 'The Keeper';
+  try {
+    const meta = await api('GET', '/voices');
+    voiceNames = new Map((meta.voices || []).map((v) => [v.id, v.name]));
+    if (meta.keeper) {
+      keeperName = meta.keeper.name || keeperName;
+      voiceNames.set(meta.keeper.id, meta.keeper.name);
+    }
+  } catch {
+    // names will fall back to ids
+  }
+
+  // Per-turn streaming machinery. Chunks are echoed raw to stderr (transcript) and
+  // streamed to stdout: greeting/closing as plain text, chat through the delimiter
+  // renderer. `done` resolves the turn and carries the authoritative payload.
+  let rawBuffer = '';
+  let resolveTurn = null;
+  let streamMode = null; // 'greeting' | 'chat' | 'plain' | null
+  let chatRenderer = null;
+
+  socket.on('chunk', ({ content }) => {
+    rawBuffer += content;
+    process.stderr.write(content);
+    if (streamMode === 'greeting' || streamMode === 'plain') { if (!jsonMode) process.stdout.write(content); }
+    else if (streamMode === 'chat' && chatRenderer) chatRenderer.feed(content);
+  });
+  socket.on('closing', (p) => {
+    process.stderr.write(`\n[closing remarks from ${p?.memberName ?? keeperName}]\n`);
+    streamMode = 'plain';
+    if (!jsonMode) process.stdout.write(`\n--- ${p?.memberName || keeperName} ---\n`);
+  });
+  socket.on('done', (payload) => {
+    const r = resolveTurn;
+    resolveTurn = null;
+    streamMode = null;
+    if (r) r({ payload });
+  });
+  socket.on('error', (p) => {
+    const r = resolveTurn;
+    resolveTurn = null;
+    streamMode = null;
+    const message = p?.message || 'unknown error';
+    if (r) r({ error: message });
+    else process.stderr.write(`\n[error] ${message}\n`);
+  });
+
+  function emitAndAwait(event, data) {
+    rawBuffer = '';
+    streamMode = event === 'greeting' ? 'greeting' : event === 'chat' ? 'chat' : null;
+    chatRenderer = event === 'chat' ? makeChatRenderer(voiceNames, keeperName) : null;
+    process.stderr.write(`\n===== RAW (${event}) =====\n`);
+    return new Promise((resolve) => {
+      resolveTurn = resolve;
+      socket.emit(event, data);
+    });
+  }
+
+  // Claim the single-active-visit lease for this surface before any turn. The
+  // backend rejects greeting/chat from a socket that hasn't `enter`ed (the
+  // "active in another window" backstop — see docs/09-single-active-visit.md);
+  // the live app emits this too. One socket per visit + reconnection:false, so a
+  // single claim once visitId is known is enough.
+  function enterVisit(id) {
+    return new Promise((resolve, reject) => {
+      socket.once('enter-ok', () => resolve());
+      socket.once('enter-denied', (p) =>
+        reject(new Error(`visit #${p?.visitId ?? id} is active in another window`)));
+      socket.emit('enter', { visitId: id });
+    });
+  }
+
+  // Client-side encryption: if this account is encrypted, wire the published
+  // crypto client (passphrase → unlock, managed → server CEK, device → refuse).
+  // null for a plaintext account (the common case), so the flow below is unchanged.
+  try {
+    encState = await setupEncryption({
+      apiUrl,
+      authHeader,
+      getKeyringRecord: async () => {
+        try { return (await api('GET', '/encryption/keyring'))?.record ?? null; } catch { return null; }
+      },
+      getUserId: async () => (await api('GET', '/auth/me')).userId,
+      getPassphrase: async () => passphrase,
+    });
+  } catch (e) {
+    die(e.message);
+  }
+  if (encState) { process.stderr.write(`\n[encryption: ${encState.tier} — visits are encrypted client-side]\n`); }
+
+  let visitId;
+  const messages = [];
+
+  if (resumeId !== undefined) {
+    const wire = await loadVisitForResume(resumeId);
+    const visit = encState ? await encState.decryptVisit(wire) : wire;
+    visitId = visit.id;
+    await enterVisit(visitId);
+    for (const m of visit.messages || []) {
+      messages.push(m);
+      renderStored(m);
+    }
+    const greeting = (visit.messages || []).find((m) => m.isGreeting && m.memberName);
+    if (greeting) keeperName = greeting.memberName;
+  } else {
+    await guardNoOngoing();
+    let created;
+    try {
+      created = await api('POST', '/visits');
+    } catch (e) {
+      die(`could not create visit: ${e.message}`);
+    }
+    visitId = created.id;
+    await enterVisit(visitId);
+
+    if (!jsonMode) process.stdout.write(`\n--- ${keeperName} ---\n`);
+    const res = await emitAndAwait('greeting', { handsFreeMode: false, memberVoices: {}, visitId, ...(encState?.turnFields || {}) });
+    if (res.error) {
+      if (jsonMode) emitJson({ type: 'error', stage: 'greeting', message: res.error });
+      die(`greeting failed: ${res.error}`);
+    }
+    if (!jsonMode) process.stdout.write('\n');
+    keeperName = res.payload.memberName || keeperName;
+    const greetingText = rawBuffer;
+    messages.push({ type: 'voice', content: greetingText, memberName: keeperName, isGreeting: true });
+    if (jsonMode) emitJson({ type: 'turn', turn: 'greeting', visitId, text: greetingText, payload: res.payload });
+    await persist(visitId, messages);
+  }
+
+  const rl = readline.createInterface({ input: process.stdin, terminal: false });
+  const lines = rl[Symbol.asyncIterator]();
+  const isTTY = Boolean(process.stdin.isTTY);
+
+  while (true) {
+    if (isTTY) process.stderr.write('\nyou> ');
+    const { value, done } = await lines.next();
+    if (done) break; // EOF — leave the visit open/resumable
+    const question = value;
+    if (question.trim() === '') continue;
+
+    render('you', question);
+    process.stderr.write(`\n===== RAW (chat) =====\nYOU: ${question}\nRESPONSE:\n`);
+
+    const res = await emitAndAwait('chat', {
+      question,
+      conversationHistory: toConversationHistory(messages),
+      handsFreeMode: false,
+      memberVoices: {},
+      visitId,
+      ...(encState?.turnFields || {}),
+    });
+    if (chatRenderer) chatRenderer.end();
+    const chatText = rawBuffer;
+    if (res.error) {
+      process.stderr.write(`\n[error] ${res.error}\n`);
+      if (jsonMode) emitJson({ type: 'turn-error', turn: 'chat', userMessage: question, message: res.error });
+      continue;
+    }
+    const p = res.payload;
+    if (jsonMode) emitJson({ type: 'turn', turn: 'chat', visitId, userMessage: question, text: chatText, payload: p });
+
+    // Display already streamed above; persist from the authoritative done payload.
+    messages.push({ type: 'user', content: question });
+    if (p.primaryResponseText) {
+      messages.push({ type: 'voice', content: p.primaryResponseText, memberName: p.primaryMemberName });
+    }
+    for (const d of p.debateMembers || []) {
+      messages.push({ type: 'voice', content: d.responseText, memberName: d.memberName });
+    }
+    if (p.moderatorSummary) {
+      messages.push({ type: 'voice', content: p.moderatorSummary, memberName: keeperName });
+    }
+
+    if (p.visitConcluded) {
+      if (p.actionPlan) {
+        const planText = typeof p.actionPlan === 'string' ? p.actionPlan : JSON.stringify(p.actionPlan, null, 2);
+        render('Action Plan', planText);
+      }
+      await persist(visitId, messages, { endDate: Date.now(), plan: p.actionPlan });
+      process.stderr.write('\n[visit concluded]\n');
+      if (jsonMode) emitJson({ type: 'end', visitId, visitConcluded: true, reason: 'concluded' });
+      socket.close();
+      rl.close();
+      process.exit(0);
+    }
+
+    await persist(visitId, messages);
+  }
+
+  if (jsonMode) emitJson({ type: 'end', visitId, visitConcluded: false, reason: 'eof' });
+  socket.close();
+  rl.close();
+  process.exit(0);
+}
+
+main().catch((e) => die(e?.stack || e?.message || String(e)));
