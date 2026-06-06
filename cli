@@ -18,8 +18,8 @@ const USAGE = `The Crossroads CLI — thin terminal client.
 Usage:
   cli [--token <api-key|jwt|user_id>] [--resume <id> | --delete <id> | --list] [--api <url>] [--json]
 
-Auth (required): --token <value> or TOKEN env. <value> is a personal API key
-(tcr_…, from Settings → API Access), a JWT, or a user_* id.
+Auth (required): --token <value> or CROSSROADS_TOKEN env. <value> is a personal
+API key (tcr_…, from Settings → API Access), a JWT, or a user_* id.
 Backend URL:     --api <url> or API_URL env (default http://localhost:3001).
 
 Modes:
@@ -51,7 +51,7 @@ if (hasFlag('--help') || hasFlag('-h')) {
   process.exit(0);
 }
 
-const credential = flagValue('--token') || process.env.TOKEN;
+const credential = flagValue('--token') || process.env.CROSSROADS_TOKEN;
 const apiUrl = (flagValue('--api') || process.env.API_URL || 'http://localhost:3001').replace(/\/+$/, '');
 const resumeId = flagValue('--resume');
 const deleteId = flagValue('--delete');
@@ -67,7 +67,7 @@ function die(msg, code = 1) {
 }
 
 if (!credential) {
-  die('no credential. Pass --token <jwt|user_id> or set TOKEN. (--help for usage)');
+  die('no credential. Pass --token <jwt|user_id> or set CROSSROADS_TOKEN. (--help for usage)');
 }
 
 // A user_* id authenticates as a legacy userId; anything else (a JWT or a

@@ -19,7 +19,7 @@ Requires Node ≥ 18 (for global `fetch`). The only dependency is
 
 Generate a personal API key in the app under **Settings → API Access**. It looks
 like `tcr_<userId>.<secret>` and is shown once — copy it then. Pass it with
-`--token`, or set `TOKEN` in the environment.
+`--token`, or set `CROSSROADS_TOKEN` in the environment.
 
 ## Use
 
