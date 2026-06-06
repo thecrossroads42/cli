@@ -8,12 +8,23 @@ for the full contract.
 
 ## Install
 
+Try it in one line — no clone, no install (grab a key from
+[Authenticate](#authenticate) first):
+
 ```
-npm install
+npx @thecrossroads42/cli --api https://thecrossroads.to --token tcr_<userId>.<secret>
 ```
 
-Requires Node ≥ 18 (for global `fetch`). The only dependency is
-`socket.io-client`.
+Or install the `crossroads` command globally:
+
+```
+npm install -g @thecrossroads42/cli
+```
+
+Requires Node ≥ 18 (for global `fetch`); the only runtime dependency is
+`socket.io-client`. The examples below use `crossroads` — substitute
+`npx @thecrossroads42/cli`, or `node cli` from a clone of this repo, as you
+prefer; they run the same program.
 
 ## Authenticate
 
@@ -25,18 +36,19 @@ like `tcr_<userId>.<secret>` and is shown once — copy it then. Pass it with
 
 ```
 # start a new visit (reads your messages from stdin, one per line)
-node cli --api https://thecrossroads.to --token tcr_<userId>.<secret>
+crossroads --api https://thecrossroads.to --token tcr_<userId>.<secret>
 
 # list your visits
-node cli --token tcr_... --list
+crossroads --token tcr_... --list
 
 # rejoin / delete a visit
-node cli --token tcr_... --resume <id>
-node cli --token tcr_... --delete <id>
+crossroads --token tcr_... --resume <id>
+crossroads --token tcr_... --delete <id>
 ```
 
 `--api` (or the `API_URL` env var) points at the backend; it defaults to
-`http://localhost:3001` for local development.
+`http://localhost:3001` for local development. Set `CROSSROADS_TOKEN` in the
+environment to skip the repeated `--token`.
 
 ### Driving an agent (`--json`)
 

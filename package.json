@@ -14,7 +14,8 @@
   },
   "files": [
     "cli",
-    "cli-crypto.js"
+    "cli-crypto.js",
+    "LICENSE"
   ],
   "dependencies": {
     "socket.io-client": "^4.8.3"
